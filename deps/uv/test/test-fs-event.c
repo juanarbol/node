@@ -133,7 +133,27 @@ static void fs_event_cb_dir(uv_fs_event_t* handle, const char* filename,
   #else
   ASSERT(filename == NULL || strcmp(filename, "file1") == 0);
   #endif
-  ASSERT(0 == uv_fs_event_stop(handle));
+  ASSERT_OK(uv_fs_event_stop(handle));
+  uv_close((uv_handle_t*)handle, close_cb);
+}
+
+static void fs_event_cb_del_dir(uv_fs_event_t* handle,
+                                const char* filename,
+                                int events,
+                                int status) {
+  ++fs_event_cb_called;
+  ASSERT_PTR_EQ(handle, &fs_event);
+  ASSERT_OK(status);
+  ASSERT(events == UV_CHANGE || events == UV_RENAME);
+  /* There is a bug in the FreeBSD kernel where the filename is sometimes NULL.
+   * Refs: https://github.com/libuv/libuv/issues/4606
+   */
+  #if defined(__FreeBSD__)
+  ASSERT(filename == NULL || strcmp(filename, "watch_del_dir") == 0);
+  #else
+  ASSERT_OK(strcmp(filename, "watch_del_dir"));
+  #endif
+  ASSERT_OK(uv_fs_event_stop(handle));
   uv_close((uv_handle_t*)handle, close_cb);
 }
 
@@ -1040,8 +1060,8 @@ TEST_IMPL(fs_event_getpath) {
     r = uv_fs_event_getpath(&fs_event, buf, &len);
     ASSERT(r == UV_EINVAL);
     r = uv_fs_event_start(&fs_event, fail_cb, watch_dir[i], 0);
-    ASSERT(r == 0);
-    len = 0;
+    ASSERT_OK(r);
+    len = 1;
     r = uv_fs_event_getpath(&fs_event, buf, &len);
     ASSERT(r == UV_ENOBUFS);
     ASSERT(len < sizeof buf); /* sanity check */

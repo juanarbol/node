@@ -43,7 +43,18 @@ Data types
     `filename` parameter will be a relative path to a file contained in the directory.
     The `events` parameter is an ORed mask of :c:type:`uv_fs_event` elements.
 
-.. c:type:: uv_fs_event
+    If the handle was started with a directory the `filename` parameter will
+    be a relative path to a file contained in the directory, or `NULL` if the
+    file name cannot be determined.
+
+    The `events` parameter is an ORed mask of :c:enum:`uv_fs_event` elements.
+
+.. note::
+   For FreeBSD path could sometimes be `NULL` due to a kernel bug.
+
+    .. _Reference: https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=197695
+
+.. c:enum:: uv_fs_event
 
     Event types that :c:type:`uv_fs_event_t` handles monitor.
 

@@ -116,9 +116,24 @@ TEST_IMPL(pipe_getsockname) {
   r = uv_pipe_getsockname(&pipe_server, buf, &len);
   ASSERT(r == 0);
 
-  ASSERT(buf[len - 1] != 0);
-  ASSERT(buf[len] == '\0');
-  ASSERT(memcmp(buf, TEST_PIPENAME, len) == 0);
+  r = uv_pipe_getsockname(&pipe_server, NULL, &len);
+  ASSERT_EQ(r, UV_EINVAL);
+
+  r = uv_pipe_getsockname(&pipe_server, buf, NULL);
+  ASSERT_EQ(r, UV_EINVAL);
+
+  r = uv_pipe_getsockname(&pipe_server, NULL, NULL);
+  ASSERT_EQ(r, UV_EINVAL);
+
+  len = sizeof(TEST_PIPENAME) - 1;
+  ASSERT_EQ(UV_ENOBUFS, uv_pipe_getsockname(&pipe_server, buf, &len));
+
+  len = sizeof(TEST_PIPENAME);
+  ASSERT_OK(uv_pipe_getsockname(&pipe_server, buf, &len));
+
+  ASSERT_NE(0, buf[len - 1]);
+  ASSERT_EQ(buf[len], '\0');
+  ASSERT_OK(memcmp(buf, TEST_PIPENAME, len));
 
   len = sizeof buf;
   r = uv_pipe_getpeername(&pipe_server, buf, &len);

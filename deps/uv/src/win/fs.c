@@ -44,6 +44,19 @@
 #define UV_FS_CLEANEDUP          0x0010
 
 
+NTSTATUS uv__RtlUnicodeStringInit(
+  PUNICODE_STRING DestinationString,
+  PWSTR SourceString,
+  size_t SourceStringLen
+) {
+  if (SourceStringLen > 0x7FFF)
+    return STATUS_INVALID_PARAMETER;
+  DestinationString->MaximumLength = DestinationString->Length =
+    SourceStringLen * sizeof(SourceString[0]);
+  DestinationString->Buffer = SourceString;
+  return STATUS_SUCCESS;
+}
+
 #define INIT(subtype)                                                         \
   do {                                                                        \
     if (req == NULL)                                                          \
@@ -1808,6 +1821,43 @@ void fs__closedir(uv_fs_t* req) {
   SET_REQ_RESULT(req, 0);
 }
 
+INLINE static fs__stat_path_return_t fs__stat_path(WCHAR* path,
+    uv_stat_t* statbuf, int do_lstat) {
+  FILE_STAT_BASIC_INFORMATION stat_info;
+
+  /* Check if the new fast API is available. */
+  if (!pGetFileInformationByName) {
+    return FS__STAT_PATH_TRY_SLOW;
+  }
+
+  /* Check if the API call fails. */
+  if (!pGetFileInformationByName(path, FileStatBasicByNameInfo, &stat_info,
+      sizeof(stat_info))) {
+    switch(GetLastError()) {
+      case ERROR_FILE_NOT_FOUND:
+      case ERROR_PATH_NOT_FOUND:
+      case ERROR_NOT_READY:
+      case ERROR_BAD_NET_NAME:
+        /* These errors aren't worth retrying with the slow path. */
+        return FS__STAT_PATH_ERROR;
+    }
+    return FS__STAT_PATH_TRY_SLOW;
+  }
+
+  /* A file handle is needed to get st_size for links. */
+  if ((stat_info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+    return FS__STAT_PATH_TRY_SLOW;
+  }
+
+  if (stat_info.DeviceType == FILE_DEVICE_NULL) {
+    fs__stat_assign_statbuf_null(statbuf);
+    return FS__STAT_PATH_SUCCESS;
+  }
+
+  fs__stat_assign_statbuf(statbuf, stat_info, do_lstat);
+  return FS__STAT_PATH_SUCCESS;
+}
+
 INLINE static int fs__stat_handle(HANDLE handle, uv_stat_t* statbuf,
     int do_lstat) {
   size_t target_length = 0;
@@ -1868,6 +1918,56 @@ INLINE static int fs__stat_handle(HANDLE handle, uv_stat_t* statbuf,
   } else {
     statbuf->st_dev = volume_info.VolumeSerialNumber;
   }
+
+  stat_info.DeviceType = device_info.DeviceType;
+  stat_info.FileAttributes = file_info.BasicInformation.FileAttributes;
+  stat_info.NumberOfLinks = file_info.StandardInformation.NumberOfLinks;
+  stat_info.FileId.QuadPart =
+      file_info.InternalInformation.IndexNumber.QuadPart;
+  stat_info.ChangeTime.QuadPart =
+      file_info.BasicInformation.ChangeTime.QuadPart;
+  stat_info.CreationTime.QuadPart =
+      file_info.BasicInformation.CreationTime.QuadPart;
+  stat_info.LastAccessTime.QuadPart =
+      file_info.BasicInformation.LastAccessTime.QuadPart;
+  stat_info.LastWriteTime.QuadPart =
+      file_info.BasicInformation.LastWriteTime.QuadPart;
+  stat_info.AllocationSize.QuadPart =
+      file_info.StandardInformation.AllocationSize.QuadPart;
+
+  if (do_lstat &&
+      (file_info.BasicInformation.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+    /*
+     * If reading the link fails, the reparse point is not a symlink and needs
+     * to be treated as a regular file. The higher level lstat function will
+     * detect this failure and retry without do_lstat if appropriate.
+     */
+    if (fs__readlink_handle(handle, NULL, &target_length) != 0) {
+      return -1;
+    }
+    stat_info.EndOfFile.QuadPart = target_length;
+  } else {
+    stat_info.EndOfFile.QuadPart =
+      file_info.StandardInformation.EndOfFile.QuadPart;
+  }
+
+  fs__stat_assign_statbuf(statbuf, stat_info, do_lstat);
+  return 0;
+}
+
+INLINE static void fs__stat_assign_statbuf_null(uv_stat_t* statbuf) {
+  memset(statbuf, 0, sizeof(uv_stat_t));
+  statbuf->st_mode = _S_IFCHR;
+  statbuf->st_mode |= (_S_IREAD | _S_IWRITE) | ((_S_IREAD | _S_IWRITE) >> 3) |
+                      ((_S_IREAD | _S_IWRITE) >> 6);
+  statbuf->st_nlink = 1;
+  statbuf->st_blksize = 4096;
+  statbuf->st_rdev = FILE_DEVICE_NULL << 16;
+}
+
+INLINE static void fs__stat_assign_statbuf(uv_stat_t* statbuf,
+    FILE_STAT_BASIC_INFORMATION stat_info, int do_lstat) {
+  statbuf->st_dev = stat_info.VolumeSerialNumber.QuadPart;
 
   /* Todo: st_mode should probably always be 0666 for everyone. We might also
    * want to report 0777 if the file is a .exe or a directory.
@@ -1990,6 +2090,179 @@ INLINE static void fs__stat_prepare_path(WCHAR* pathw) {
   }
 }
 
+INLINE static DWORD fs__stat_directory(WCHAR* path, uv_stat_t* statbuf,
+    int do_lstat, DWORD ret_error) {
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  FILE_STAT_BASIC_INFORMATION stat_info;
+  FILE_ID_FULL_DIR_INFORMATION dir_info;
+  FILE_FS_VOLUME_INFORMATION volume_info;
+  FILE_FS_DEVICE_INFORMATION device_info;
+  IO_STATUS_BLOCK io_status;
+  NTSTATUS nt_status;
+  WCHAR* path_dirpath = NULL;
+  WCHAR* path_filename = NULL;
+  UNICODE_STRING FileMask;
+  size_t len;
+  size_t split;
+  WCHAR splitchar;
+  int includes_name;
+
+  /* AKA strtok or wcscspn, in reverse. */
+  len = wcslen(path);
+  split = len;
+
+  includes_name = 0;
+  while (split > 0 && path[split - 1] != L'\\' && path[split - 1] != L'/' &&
+                      path[split - 1] != L':') {
+    /* check if the path contains a character other than /,\,:,. */
+    if (path[split-1] != '.') {
+      includes_name = 1;
+    }
+    split--;
+  }
+  /* If the path is a relative path with a file name or a folder name */
+  if (split == 0 && includes_name) {
+    path_dirpath = L".";
+  /* If there is a slash or a backslash */
+  } else if (path[split - 1] == L'\\' || path[split - 1] == L'/') {
+    path_dirpath = path;
+    /* If there is no filename, consider it as a relative folder path */
+    if (!includes_name) {
+      split = len;
+    /* Else, split it */
+    } else {
+      splitchar = path[split - 1];
+      path[split - 1] = L'\0';
+    }
+  /* e.g. "..", "c:" */
+  } else {
+    path_dirpath = path;
+    split = len;
+  }
+  path_filename = &path[split];
+
+  len = 0;
+  while (1) {
+    if (path_filename[len] == L'\0')
+      break;
+    if (path_filename[len] == L'*' || path_filename[len] == L'?' ||
+        path_filename[len] == L'>' || path_filename[len] == L'<' ||
+        path_filename[len] == L'"') {
+      ret_error = ERROR_INVALID_NAME;
+      goto cleanup;
+    }
+    len++;
+  }
+
+  /* Get directory handle */
+  handle = CreateFileW(path_dirpath,
+                       FILE_LIST_DIRECTORY,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       NULL,
+                       OPEN_EXISTING,
+                       FILE_FLAG_BACKUP_SEMANTICS,
+                       NULL);
+
+  if (handle == INVALID_HANDLE_VALUE) {
+    ret_error = GetLastError();
+    goto cleanup;
+  }
+
+  /* Get files in the directory */
+  nt_status = uv__RtlUnicodeStringInit(&FileMask, path_filename, len);
+  if (!NT_SUCCESS(nt_status)) {
+    ret_error = pRtlNtStatusToDosError(nt_status);
+    goto cleanup;
+  }
+  nt_status = pNtQueryDirectoryFile(handle,
+                                    NULL,
+                                    NULL,
+                                    NULL,
+                                    &io_status,
+                                    &dir_info,
+                                    sizeof(dir_info),
+                                    FileIdFullDirectoryInformation,
+                                    TRUE,
+                                    &FileMask,
+                                    TRUE);
+
+  /* Buffer overflow (a warning status code) is expected here since there isn't
+   * enough space to store the FileName, and actually indicates success. */
+  if (!NT_SUCCESS(nt_status) && nt_status != STATUS_BUFFER_OVERFLOW) {
+    if (nt_status == STATUS_NO_MORE_FILES)
+      ret_error = ERROR_PATH_NOT_FOUND;
+    else
+      ret_error = pRtlNtStatusToDosError(nt_status);
+    goto cleanup;
+  }
+
+  /* Assign values to stat_info */
+  memset(&stat_info, 0, sizeof(FILE_STAT_BASIC_INFORMATION));
+  stat_info.FileAttributes = dir_info.FileAttributes;
+  stat_info.CreationTime.QuadPart = dir_info.CreationTime.QuadPart;
+  stat_info.LastAccessTime.QuadPart = dir_info.LastAccessTime.QuadPart;
+  stat_info.LastWriteTime.QuadPart = dir_info.LastWriteTime.QuadPart;
+  if (stat_info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+    /* A file handle is needed to get st_size for the link (from
+     * FSCTL_GET_REPARSE_POINT), which is required by posix, but we are here
+     * because getting the file handle failed. We could get just the
+     * ReparsePointTag by querying FILE_ID_EXTD_DIR_INFORMATION instead to make
+     * sure this really is a link before giving up here on the uv_fs_stat call,
+     * but that doesn't seem essential. */
+    if (!do_lstat)
+      goto cleanup;
+    stat_info.EndOfFile.QuadPart = 0;
+    stat_info.AllocationSize.QuadPart = 0;
+  } else {
+    stat_info.EndOfFile.QuadPart = dir_info.EndOfFile.QuadPart;
+    stat_info.AllocationSize.QuadPart = dir_info.AllocationSize.QuadPart;
+  }
+  stat_info.ChangeTime.QuadPart = dir_info.ChangeTime.QuadPart;
+  stat_info.FileId.QuadPart = dir_info.FileId.QuadPart;
+
+  /* Finish up by getting device info from the directory handle,
+   * since files presumably must live on their device. */
+  nt_status = pNtQueryVolumeInformationFile(handle,
+                                            &io_status,
+                                            &volume_info,
+                                            sizeof volume_info,
+                                            FileFsVolumeInformation);
+
+  /* Buffer overflow (a warning status code) is expected here. */
+  if (io_status.Status == STATUS_NOT_IMPLEMENTED) {
+    stat_info.VolumeSerialNumber.QuadPart = 0;
+  } else if (NT_ERROR(nt_status)) {
+    ret_error = pRtlNtStatusToDosError(nt_status);
+    goto cleanup;
+  } else {
+    stat_info.VolumeSerialNumber.QuadPart = volume_info.VolumeSerialNumber;
+  }
+
+  nt_status = pNtQueryVolumeInformationFile(handle,
+                                            &io_status,
+                                            &device_info,
+                                            sizeof device_info,
+                                            FileFsDeviceInformation);
+
+  /* Buffer overflow (a warning status code) is expected here. */
+  if (NT_ERROR(nt_status)) {
+    ret_error = pRtlNtStatusToDosError(nt_status);
+    goto cleanup;
+  }
+
+  stat_info.DeviceType = device_info.DeviceType;
+  stat_info.NumberOfLinks = 1; /* No way to recover this info. */
+
+  fs__stat_assign_statbuf(statbuf, stat_info, do_lstat);
+  ret_error = 0;
+
+cleanup:
+  if (split != 0)
+    path[split - 1] = splitchar;
+  if (handle != INVALID_HANDLE_VALUE)
+    CloseHandle(handle);
+  return ret_error;
+}
 
 INLINE static DWORD fs__stat_impl_from_path(WCHAR* path,
                                             int do_lstat,
@@ -1998,6 +2271,17 @@ INLINE static DWORD fs__stat_impl_from_path(WCHAR* path,
   DWORD flags;
   DWORD ret;
 
+  /* If new API exists, try to use it. */
+  switch (fs__stat_path(path, statbuf, do_lstat)) {
+    case FS__STAT_PATH_SUCCESS:
+      return 0;
+    case FS__STAT_PATH_ERROR:
+      return GetLastError();
+    case FS__STAT_PATH_TRY_SLOW:
+      break;
+  }
+
+  /* If the new API does not exist, use the old API. */
   flags = FILE_FLAG_BACKUP_SEMANTICS;
   if (do_lstat)
     flags |= FILE_FLAG_OPEN_REPARSE_POINT;
@@ -2010,8 +2294,12 @@ INLINE static DWORD fs__stat_impl_from_path(WCHAR* path,
                        flags,
                        NULL);
 
-  if (handle == INVALID_HANDLE_VALUE)
-    return GetLastError();
+  if (handle == INVALID_HANDLE_VALUE) {
+    ret = GetLastError();
+    if (ret != ERROR_ACCESS_DENIED && ret != ERROR_SHARING_VIOLATION)
+      return ret;
+    return fs__stat_directory(path, statbuf, do_lstat, ret);
+  }
 
   if (fs__stat_handle(handle, statbuf, do_lstat) != 0)
     ret = GetLastError();
